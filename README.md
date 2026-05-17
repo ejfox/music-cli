@@ -10,8 +10,10 @@ Reads R2 directly for instant truth; writes go through wrangler. Powers [music.t
 mkdir -p ~/bin
 curl -fsSL https://raw.githubusercontent.com/ejfox/music-cli/main/bin/music -o ~/bin/music
 chmod +x ~/bin/music
-music setup
+~/bin/music setup
 ```
+
+(Last line uses the absolute path so it works even if `~/bin` isn't on your `$PATH` yet.)
 
 `music setup` will:
 - Install missing deps via Homebrew (`ffmpeg`, `jq`, `awscli`, `node`)

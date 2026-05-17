@@ -83,6 +83,19 @@ confirm() {
   [[ "$ans" == "y" || "$ans" == "Y" ]]
 }
 
+# --- wrangler wrapper -----------------------------------------------------
+# captures stderr to a temp log; on failure, shows last 5 lines so you see why.
+wr() {
+  local log=$(mktemp)
+  if ! wrangler "$@" >/dev/null 2>"$log"; then
+    print -u2 "${PINK}wrangler $1 failed:${RST}"
+    tail -5 "$log" >&2
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
+}
+
 # --- R2 read helpers (authoritative, no cache) ----------------------------
 # emit TSV: key<TAB>size<TAB>lastmod
 # matches the music app's filter: prefixes music/ + field-recordings/, plus
@@ -239,11 +252,11 @@ cmd_mv() {
   confirm "confirm?" || { print "${MUTED}aborted${RST}"; exit 0; }
 
   local tmp="/tmp/music-mv-$$-${filename}"
-  wrangler r2 object get "$BUCKET/$src" --file="$tmp" --remote >/dev/null 2>&1 || die "download failed"
-  wrangler r2 object put "$BUCKET/$dst" --file="$tmp" --remote >/dev/null 2>&1 || { rm -f "$tmp"; die "upload failed"; }
-  wrangler r2 object delete "$BUCKET/$src" --remote >/dev/null 2>&1 || { rm -f "$tmp"; die "delete-old failed (orphan at $dst)"; }
+  wr r2 object get "$BUCKET/$src" --file="$tmp" --remote || die "download failed"
+  wr r2 object put "$BUCKET/$dst" --file="$tmp" --remote || { rm -f "$tmp"; die "upload failed"; }
+  wr r2 object delete "$BUCKET/$src" --remote || { rm -f "$tmp"; die "delete-old failed (orphan at $dst)"; }
   rm -f "$tmp"
-  bust_cache
+  note_cache_lag
   print "${TEAL}ok ✓${RST}  $dst"
 }
 
@@ -258,8 +271,8 @@ cmd_rm() {
     print -n "type the filename to confirm (${key##*/}): "; read typed
     [[ "$typed" != "${key##*/}" ]] && { print "${MUTED}aborted (no match)${RST}"; exit 0; }
   fi
-  wrangler r2 object delete "$BUCKET/$key" --remote >/dev/null 2>&1 || die "delete failed"
-  bust_cache
+  wr r2 object delete "$BUCKET/$key" --remote || die "delete failed"
+  note_cache_lag
   print "${TEAL}deleted ✓${RST}"
 }
 
@@ -283,10 +296,16 @@ cmd_put() {
       # preserve the original basename so the uploaded key is foo.mp3, not music-conv-PID-foo.mp3
       local conv_dir="/tmp/music-conv-$$"
       mkdir -p "$conv_dir"
+      trap '[[ -n "${conv_dir:-}" && -d "$conv_dir" ]] && rm -rf "$conv_dir"' EXIT
       local base="${local_file##*/}"
       local mp3_file="$conv_dir/${base%.[Ww][Aa][Vv]}.mp3"
       print "${MUTED}converting → ${mp3_file##*/} (${BITRATE})${RST}"
-      ffmpeg -hide_banner -loglevel error -y -i "$local_file" -codec:a libmp3lame -b:a "$BITRATE" "$mp3_file" || die "ffmpeg failed"
+      local ff_log=$(mktemp)
+      if ! ffmpeg -hide_banner -y -i "$local_file" -codec:a libmp3lame -b:a "$BITRATE" "$mp3_file" 2>"$ff_log"; then
+        print -u2 "${PINK}ffmpeg failed:${RST}"; tail -5 "$ff_log" >&2; rm -f "$ff_log"
+        die "conversion failed"
+      fi
+      rm -f "$ff_log"
       local_file="$mp3_file"
     fi
   fi
@@ -310,9 +329,9 @@ cmd_put() {
     exit 2
   fi
   confirm "confirm?" || { print "${MUTED}aborted${RST}"; [[ -n "${conv_dir:-}" ]] && rm -rf "$conv_dir"; exit 0; }
-  wrangler r2 object put "$BUCKET/$dst" --file="$local_file" --remote >/dev/null 2>&1 || { [[ -n "${conv_dir:-}" ]] && rm -rf "$conv_dir"; die "upload failed"; }
+  wr r2 object put "$BUCKET/$dst" --file="$local_file" --remote || { [[ -n "${conv_dir:-}" ]] && rm -rf "$conv_dir"; die "upload failed"; }
   [[ -n "${conv_dir:-}" ]] && rm -rf "$conv_dir"
-  bust_cache
+  note_cache_lag
   print "${TEAL}ok ✓${RST}  $dst"
 }
 
@@ -322,7 +341,7 @@ cmd_get() {
   local key=$(resolve_track "$query") || exit 1
   [[ -z "$out" ]] && out="./${key##*/}"
   print "${TEAL}download:${RST} $key ${MUTED}->${RST} $out"
-  wrangler r2 object get "$BUCKET/$key" --file="$out" --remote >/dev/null 2>&1 || die "download failed"
+  wr r2 object get "$BUCKET/$key" --file="$out" --remote || die "download failed"
   print "${TEAL}ok ✓${RST}  $out"
 }
 
@@ -434,7 +453,8 @@ cmd_import() {
 
     # determine destination + execute
     local title="${base%.*}"
-    local clean_title=$(print -- "$title" | tr '_' ' ' | sed 's/  */ /g')
+    # strip quotes/backslashes so they don't break ffmpeg -metadata flags
+    local clean_title=$(print -- "$title" | tr '_' ' ' | tr -d '"\\' | sed 's/  */ /g')
 
     if [[ "$category" == "speech" ]]; then
       mkdir -p "$VOICEMEMO_DIR"
@@ -497,7 +517,7 @@ cmd_import() {
       skipped=$((skipped+1))
       continue
     fi
-    wrangler r2 object put "$BUCKET/$out_key" --file="$mp3_tmp" --remote >/dev/null 2>&1 \
+    wr r2 object put "$BUCKET/$out_key" --file="$mp3_tmp" --remote \
       || { rm -f "$mp3_tmp"; print "${PINK}  upload failed${RST}\n"; skipped=$((skipped+1)); continue; }
     rm -f "$mp3_tmp"
 
@@ -518,25 +538,16 @@ cmd_new_album() {
   local key="music/$kebab/.placeholder"
   confirm "create music/$kebab/ ?" || { print "${MUTED}aborted${RST}"; exit 0; }
   print "placeholder" > /tmp/.music-placeholder
-  wrangler r2 object put "$BUCKET/$key" --file=/tmp/.music-placeholder --remote >/dev/null 2>&1 || die "create failed"
+  wr r2 object put "$BUCKET/$key" --file=/tmp/.music-placeholder --remote || die "create failed"
   rm -f /tmp/.music-placeholder
-  bust_cache
+  note_cache_lag
   print "${TEAL}created${RST} music/$kebab/"
 }
 
-# bust the 5-min cache in the smallweb music app by hitting a fresh request
-bust_cache() {
-  # the app caches /api/tracks for 5 min. there's no public bust endpoint,
-  # but hitting / forces SSR to fetch fresh if cache expired. nothing we can do
-  # to forcibly expire it from outside without an admin endpoint.
-  # so: just warn the user.
+# note: music.tools.ejfox.com caches /api/tracks for 5 min server-side.
+# no public bust endpoint — the CLI reads R2 directly so it's always fresh.
+note_cache_lag() {
   print -u2 "${MUTED}(music.tools.ejfox.com may take up to 5 min to reflect changes — R2 is authoritative)${RST}"
-}
-
-cmd_refresh() {
-  print "${MUTED}cache is server-side and time-based (5 min). use R2 truth instead:${RST}"
-  print "  music ls         ${MUTED}# reads R2 directly${RST}"
-  print "  curl -sI https://r2.ejfox.com/<key>  ${MUTED}# check a specific file${RST}"
 }
 
 # --- setup / login --------------------------------------------------------
@@ -569,7 +580,12 @@ cmd_login() {
   fi
   if [[ -z "$secret_key" ]]; then
     print -n "R2 secret access key: "
-    stty -echo; read secret_key; stty echo; print ""
+    trap 'stty echo 2>/dev/null; exit 130' INT TERM
+    stty -echo
+    read secret_key
+    stty echo
+    trap - INT TERM
+    print ""
   fi
   print -n "account id ${MUTED}[${account_id}]${RST}: "; read acc_in
   [[ -n "$acc_in" ]] && account_id="$acc_in"
@@ -680,13 +696,16 @@ cmd_install_watcher() {
   cat > "$handler" <<'HANDLER'
 #!/bin/zsh
 # music-cli — fires when /Volumes/ changes; auto-imports on TP-7 mount
+# uses a .command file so macOS routes to whichever terminal you've set as
+# default for .command (Terminal.app by default; can be Ghostty or anything).
 set -u
 SEEN=/tmp/.music-tp7-seen
+MUSIC_BIN="${MUSIC_BIN:-$HOME/bin/music}"
 
 TP7_VOL=""
 for v in /Volumes/*(N); do
   case "${v:l:t}" in
-    tp-7|tp7|tp-7*|tp7*|*tp-7*|*tp7*) TP7_VOL="$v"; break ;;
+    *tp-7*|*tp7*) TP7_VOL="$v"; break ;;
   esac
 done
 
@@ -694,12 +713,16 @@ if [[ -n "$TP7_VOL" && ! -f "$SEEN" ]]; then
   touch "$SEEN"
   COUNT=$(find "$TP7_VOL" -maxdepth 3 -type f \( -iname '*.wav' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.aiff' -o -iname '*.flac' \) 2>/dev/null | wc -l | tr -d ' ')
   osascript -e "display notification \"$COUNT audio files — opening import\" with title \"TP-7 mounted\" sound name \"Glass\""
-  /usr/bin/osascript <<APPLE
-tell application "Terminal"
-  activate
-  do script "music import '$TP7_VOL'"
-end tell
-APPLE
+
+  # write a .command file and open it — respects your default .command handler
+  CMD_FILE="/tmp/music-tp7-import.command"
+  ESCAPED_VOL="${TP7_VOL//\'/\'\\\'\'}"
+  cat > "$CMD_FILE" <<CMD
+#!/bin/zsh
+exec "$MUSIC_BIN" import '$ESCAPED_VOL'
+CMD
+  chmod +x "$CMD_FILE"
+  open "$CMD_FILE"
 elif [[ -z "$TP7_VOL" && -f "$SEEN" ]]; then
   rm -f "$SEEN"
 fi
@@ -803,7 +826,6 @@ case "${1:-ls}" in
   info|probe) shift; cmd_info "$@" ;;
   import) shift; cmd_import "$@" ;;
   new-album|mkalbum) shift; cmd_new_album "$@" ;;
-  refresh) cmd_refresh ;;
   setup) cmd_setup ;;
   login) cmd_login ;;
   install-watcher) cmd_install_watcher ;;
