@@ -25,7 +25,11 @@
 set -u
 
 # --- setup ----------------------------------------------------------------
-[ -s "/opt/homebrew/opt/nvm/nvm.sh" ] && . "/opt/homebrew/opt/nvm/nvm.sh" >/dev/null 2>&1
+# source NVM so wrangler (an npm global) lands on PATH — works on Apple Silicon + Intel
+for _nvm_sh in /opt/homebrew/opt/nvm/nvm.sh /usr/local/opt/nvm/nvm.sh "${NVM_DIR:-$HOME/.nvm}/nvm.sh"; do
+  [ -s "$_nvm_sh" ] && { . "$_nvm_sh" >/dev/null 2>&1; break; }
+done
+unset _nvm_sh
 export CLOUDFLARE_ACCOUNT_ID=deffa184038440afc07f53b5e7583a97
 
 BUCKET=ejfox-personal
