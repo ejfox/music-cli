@@ -778,6 +778,93 @@ cmd_uninstall_watcher() {
   rm -f "$SHARE_DIR/tp7-mount-handler.sh" "$SHARE_DIR/watcher.log" /tmp/.music-tp7-seen
 }
 
+cmd_radio() {
+  local sub="${1:-open}"
+  case "$sub" in
+    open|"") open "https://radio.tools.ejfox.com/" 2>/dev/null || print "https://radio.tools.ejfox.com/radio" ;;
+    url) print "https://radio.tools.ejfox.com/radio" ;;
+    *) die "usage: music radio [open|url]" ;;
+  esac
+}
+
+# --- slot (radio scheduling) ----------------------------------------------
+# all slot ops are server-side — schedule.json lives at /var/lib/radio/ on the VPS
+VPS_SSH="${MUSIC_VPS:-vps-pub}"
+RADIO_SCHEDULE="/var/lib/radio/schedule.json"
+
+slot_fetch() {
+  ssh "$VPS_SSH" "cat $RADIO_SCHEDULE 2>/dev/null || echo '{\"slots\":[]}'"
+}
+
+cmd_slot() {
+  local sub="${1:-list}"; shift 2>/dev/null
+  case "$sub" in
+    list|ls|"")
+      local data=$(slot_fetch)
+      local count=$(print -- "$data" | jq -r '.slots | length')
+      if [[ "$JSON" == "1" ]]; then print -- "$data"; return; fi
+      if [[ "$count" == "0" ]]; then
+        print "${MUTED}(no slots scheduled — fallback is shuffle of music/)${RST}"
+        print "${MUTED}add one: music slot add 'mon-fri 9-12' <album>${RST}"
+        return
+      fi
+      print "${BOLD}schedule${RST}  ${MUTED}($count slot$([[ $count -eq 1 ]] || print s))${RST}"
+      print -- "$data" | jq -r '.slots | to_entries[] | "  [\(.key)]  \(.value.days | ascii_upcase)  \(.value.time)  → \(.value.source)"'
+      print "\n${MUTED}fallback: shuffle music/${RST}"
+      ;;
+    add)
+      local when="${1:-}" src="${2:-}"
+      [[ -z "$when" || -z "$src" ]] && die "usage: music slot add 'mon-fri 9-12' <album>"
+      # split when → days + time
+      local days="${when%% *}"; local time="${when#* }"
+      [[ "$days" == "$time" ]] && die "couldn't parse '$when' — expected '<days> <time>' (e.g. 'mon-fri 9-12')"
+      # resolve album against R2 (fuzzy)
+      local resolved=$(resolve_album "$src")
+      print "${TEAL}adding slot:${RST} $days $time → $resolved"
+      ssh "$VPS_SSH" "python3 - <<PY
+import json
+p='$RADIO_SCHEDULE'
+d=json.load(open(p))
+d.setdefault('slots', []).append({'days':'$days', 'time':'$time', 'source':'$resolved'})
+json.dump(d, open(p,'w'), indent=2)
+print(f'now {len(d[\"slots\"])} slot(s)')
+PY"
+      print "${MUTED}run 'music slot apply' to publish${RST}"
+      ;;
+    rm|remove|del)
+      local idx="${1:-}"
+      [[ -z "$idx" ]] && die "usage: music slot rm <index>  (see 'music slot list')"
+      ssh "$VPS_SSH" "python3 - <<PY
+import json,sys
+p='$RADIO_SCHEDULE'
+d=json.load(open(p))
+i=int('$idx')
+if i<0 or i>=len(d.get('slots',[])):
+    sys.stderr.write(f'no slot {i} (have {len(d.get(\"slots\",[]))})\n'); sys.exit(1)
+removed = d['slots'].pop(i)
+json.dump(d, open(p,'w'), indent=2)
+print(f'removed: {removed}')
+PY"
+      print "${MUTED}run 'music slot apply' to publish${RST}"
+      ;;
+    edit)
+      ssh -t "$VPS_SSH" "\${EDITOR:-nvim} $RADIO_SCHEDULE"
+      print "${MUTED}run 'music slot apply' to publish${RST}"
+      ;;
+    apply|reload)
+      print "${TEAL}regenerating liquidsoap config...${RST}"
+      ssh "$VPS_SSH" "sudo /usr/local/bin/radio-gen && sudo systemctl restart liquidsoap-radio"
+      sleep 4
+      if curl -sf -m 5 -o /dev/null https://radio.tools.ejfox.com/radio; then
+        print "${TEAL}applied ✓${RST}  stream is back up"
+      else
+        print "${PINK}WARNING: stream not responding — check ssh $VPS_SSH sudo journalctl -u liquidsoap-radio -n 20${RST}"
+      fi
+      ;;
+    *) die "unknown slot command: $sub (try: list|add|rm|edit|apply)" ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 ${BOLD}music${RST} — manage music.tools.ejfox.com tracks from your terminal
@@ -797,6 +884,14 @@ ${BOLD}commands${RST}
   ${TEAL}music info${RST} <track>             ffprobe metadata for an R2 track
   ${TEAL}music import${RST} <dir>             walk a folder, ask category per file, tag + upload
   ${TEAL}music new-album${RST} <name>         create a new album folder
+
+${BOLD}radio${RST}  ${MUTED}— radio.tools.ejfox.com${RST}
+  ${TEAL}music radio${RST}                    open the radio in your browser
+  ${TEAL}music slot${RST}                     list current schedule
+  ${TEAL}music slot add${RST} <when> <src>    add a slot ('mon-fri 9-12' field-recordings)
+  ${TEAL}music slot rm${RST} <index>          remove slot by index
+  ${TEAL}music slot edit${RST}                $EDITOR on schedule.json over ssh
+  ${TEAL}music slot apply${RST}               regenerate liquidsoap config + restart (~3s gap)
 
 ${BOLD}setup${RST}
   ${TEAL}music setup${RST}                    install deps + LaunchAgent (run once on a new machine)
@@ -830,6 +925,8 @@ case "${1:-ls}" in
   info|probe) shift; cmd_info "$@" ;;
   import) shift; cmd_import "$@" ;;
   new-album|mkalbum) shift; cmd_new_album "$@" ;;
+  radio) shift; cmd_radio "$@" ;;
+  slot) shift; cmd_slot "$@" ;;
   setup) cmd_setup ;;
   login) cmd_login ;;
   install-watcher) cmd_install_watcher ;;
